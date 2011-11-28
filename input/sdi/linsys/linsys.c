@@ -135,8 +135,24 @@ typedef struct
     int64_t      v_counter;
     AVRational   v_timebase;
 
+    /* low-latency */
+    int          frame_phase;
+    int          frame_slices;
+    int          slice_height;
+    int          line_idx; /* index of line in v210 array */
+
     obe_raw_frame_t *raw_frame;
     void (*unpack_line) ( const uint32_t *src, uint16_t *y, uint16_t *u, uint16_t *v, int width );
+
+    /* field 1 and used in progressive mode */
+    uint16_t     *y_dst_f1;
+    uint16_t     *u_dst_f1;
+    uint16_t     *v_dst_f1;
+
+    /* field 2 */
+    uint16_t     *y_dst_f2;
+    uint16_t     *u_dst_f2;
+    uint16_t     *v_dst_f2;
 
     /* audio device reader */
     int          afd;
@@ -275,21 +291,118 @@ static void close_card( linsys_opts_t *linsys_opts )
     close( linsys_ctx->afd );
 }
 
-static int handle_video_frame( linsys_opts_t *linsys_opts, uint8_t *data )
+static int new_frame( linsys_opts_t *linsys_opts )
+{
+    linsys_ctx_t *linsys_ctx = &linsys_opts->linsys_ctx;
+
+    if( linsys_ctx->non_display_parser.has_probed )
+        return 0;
+
+    /* Create raw frame */
+    linsys_ctx->raw_frame = new_raw_frame();
+    if( !linsys_ctx->raw_frame )
+    {
+        syslog( LOG_ERR, "Malloc failed\n" );
+        return -1;
+    }
+    obe_image_t *output = &linsys_ctx->raw_frame->alloc_img;
+
+    linsys_ctx->raw_frame->release_data = obe_release_video_data;
+    linsys_ctx->raw_frame->release_frame = obe_release_frame;
+
+    output->csp = PIX_FMT_YUV422P10;
+    output->planes = av_pix_fmt_descriptors[output->csp].nb_components;
+    output->width = linsys_ctx->width;
+    output->height = linsys_ctx->coded_height;
+
+    if( av_image_fill_linesizes( output->stride, output->csp, output->width ) < 0 )
+        return -1;
+
+    if( av_image_alloc( output->plane, output->stride, output->width, output->height + 2, output->csp, 16 ) < 0 )
+        return -1;
+
+    linsys_ctx->y_dst_f1 = linsys_ctx->y_dst_f2 = (uint16_t*)output->plane[0];
+    linsys_ctx->u_dst_f1 = linsys_ctx->u_dst_f2 = (uint16_t*)output->plane[1];
+    linsys_ctx->v_dst_f1 = linsys_ctx->v_dst_f2 = (uint16_t*)output->plane[2];
+
+    if( linsys_opts->interlaced )
+    {
+        /* If we can only access the active frame in NTSC mode then write the first field we receive over the wire (i.e field 2)
+	 * first. */
+        if( !linsys_ctx->has_vanc && linsys_opts->video_format == INPUT_VIDEO_FORMAT_NTSC )
+        {
+            linsys_ctx->y_dst_f1 += output->stride[0] / 2;
+            linsys_ctx->u_dst_f1 += output->stride[1] / 2;
+            linsys_ctx->v_dst_f1 += output->stride[2] / 2;
+        }
+        else
+        {
+            linsys_ctx->y_dst_f2 += output->stride[0] / 2;
+            linsys_ctx->u_dst_f2 += output->stride[1] / 2;
+            linsys_ctx->v_dst_f2 += output->stride[2] / 2;
+        }
+    }
+
+    return 0;
+}
+
+static void handle_lines( linsys_opts_t *linsys_opts, uint8_t *data )
+{
+    linsys_ctx_t *linsys_ctx = &linsys_opts->linsys_ctx;
+    obe_image_t *output = &linsys_ctx->raw_frame->alloc_img;
+
+    /* Interleave fields */
+    if( linsys_opts->interlaced )
+    {
+        /* Could do this using actual line numbers but it's simpler just to do an alternate interleave */
+        int threshold = (linsys_ctx->coded_height+1) >> 1;
+        for( int i = 0; i < linsys_ctx->slice_height; i++ )
+        {
+            /* Note that each pointer is incremented by two lines */
+            if( linsys_ctx->line_idx < threshold )
+            {
+                obe_decode_line( linsys_ctx, (const uint32_t*)data, linsys_ctx->y_dst_f1, linsys_ctx->u_dst_f1, linsys_ctx->v_dst_f1 );
+
+                linsys_ctx->y_dst_f1 += output->stride[0];
+                linsys_ctx->u_dst_f1 += output->stride[1];
+                linsys_ctx->v_dst_f1 += output->stride[2];
+            }
+            else
+            {
+                obe_decode_line( linsys_ctx, (const uint32_t*)data, linsys_ctx->y_dst_f2, linsys_ctx->u_dst_f2, linsys_ctx->v_dst_f2 );
+
+                linsys_ctx->y_dst_f2 += output->stride[0];
+                linsys_ctx->u_dst_f2 += output->stride[1];
+                linsys_ctx->v_dst_f2 += output->stride[2];
+            }
+
+            data += linsys_ctx->stride;
+            linsys_ctx->line_idx++;
+        }
+    }
+    else
+    {
+        for( int i = 0; i < linsys_ctx->slice_height; i++ )
+        {
+            obe_decode_line( linsys_ctx, (const uint32_t*)data, linsys_ctx->y_dst_f1, linsys_ctx->u_dst_f1, linsys_ctx->v_dst_f1 );
+
+            linsys_ctx->y_dst_f1 += output->stride[0] / 2;
+            linsys_ctx->u_dst_f1 += output->stride[1] / 2;
+            linsys_ctx->v_dst_f1 += output->stride[2] / 2;
+            data += linsys_ctx->stride;
+        }
+    }
+}
+
+static int handle_video_frame( linsys_opts_t *linsys_opts )
 {
     linsys_ctx_t *linsys_ctx = &linsys_opts->linsys_ctx;
     obe_t *h = linsys_ctx->h;
-    obe_raw_frame_t *raw_frame = NULL;
     int num_anc_lines = 0, anc_line_stride, first_line = 0, last_line = 0, cur_line, num_vbi_lines, vii_line, tmp_line, stream_id;
     uint16_t *anc_buf = NULL, *anc_buf_pos = NULL;
     uint16_t *y_src, *u_src, *v_src;
     uint8_t *vbi_buf;
     int64_t pts;
-
-    obe_image_t *output;
-
-    if( linsys_ctx->non_display_parser.has_probed )
-        return 0;
 
     if( linsys_ctx->last_frame_time == -1 )
         linsys_ctx->last_frame_time = obe_mdate();
@@ -315,86 +428,8 @@ static int handle_video_frame( linsys_opts_t *linsys_opts, uint8_t *data )
             break;
     }
 
-    /* Create raw frame */
-    raw_frame = new_raw_frame();
-    if( !raw_frame )
-    {
-        syslog( LOG_ERR, "Malloc failed\n" );
-        return -1;
-    }
-    output = &raw_frame->alloc_img;
-
-    raw_frame->release_data = obe_release_video_data;
-    raw_frame->release_frame = obe_release_frame;
-
-    output->csp = PIX_FMT_YUV422P10;
-    output->planes = av_pix_fmt_descriptors[output->csp].nb_components;
-    output->width = linsys_ctx->width;
-    output->height = linsys_opts->height;
-
-    if( av_image_fill_linesizes( output->stride, output->csp, output->width ) < 0 )
-        goto fail;
-
-    if( av_image_alloc( output->plane, output->stride, linsys_ctx->width, linsys_ctx->coded_height + 1, PIX_FMT_YUV422P10, 16 ) < 0 )
-        goto fail;
-
-    uint16_t *y_dst = (uint16_t*)output->plane[0];
-    uint16_t *u_dst = (uint16_t*)output->plane[1];
-    uint16_t *v_dst = (uint16_t*)output->plane[2];
-
-    /* Interleave fields */
-    if( linsys_opts->interlaced )
-    {
-        uint8_t *v210_src_f1, *v210_src_f2;
-
-        int k;
-        for( k = 0; field_start_lines[k].format != -1; k++ )
-        {
-            if( linsys_opts->video_format == field_start_lines[k].format )
-                break;
-        }
-
-        v210_src_f1 = v210_src_f2 = data;
-
-        /* If we can only access the active frame in NTSC mode then swap the field order */
-        if( !linsys_ctx->has_vanc && linsys_opts->video_format == INPUT_VIDEO_FORMAT_NTSC )
-            v210_src_f1 += (linsys_ctx->coded_height / 2) * linsys_ctx->stride;
-        else if( linsys_ctx->has_vanc )
-            v210_src_f2 += (field_start_lines[k].field_two - field_start_lines[k].line) * linsys_ctx->stride;
-        else
-            /* All non-VANC resolutions have an even height */
-            v210_src_f2 += (linsys_ctx->coded_height / 2) * linsys_ctx->stride;
-
-        for( int i = 0; i < linsys_ctx->coded_height; i++ )
-        {
-            if( !(i & 1) )
-            {
-                obe_decode_line( linsys_ctx, (const uint32_t*)v210_src_f1, y_dst, u_dst, v_dst );
-                v210_src_f1 += linsys_ctx->stride;
-            }
-            else
-            {
-                obe_decode_line( linsys_ctx, (const uint32_t*)v210_src_f2, y_dst, u_dst, v_dst );
-                v210_src_f2 += linsys_ctx->stride;
-            }
-
-            y_dst += output->stride[0] / 2;
-            u_dst += output->stride[1] / 2;
-            v_dst += output->stride[2] / 2;
-        }
-    }
-    else
-    {
-        for( int i = 0; i < linsys_ctx->coded_height; i++ )
-        {
-            obe_decode_line( linsys_ctx, (const uint32_t*)data, y_dst, u_dst, v_dst );
-
-            data += linsys_ctx->stride;
-            y_dst += output->stride[0] / 2;
-            u_dst += output->stride[1] / 2;
-            v_dst += output->stride[2] / 2;
-        }
-    }
+    obe_raw_frame_t *raw_frame = linsys_ctx->raw_frame;
+    obe_image_t *output = &raw_frame->alloc_img;
 
     anc_line_stride = FFALIGN( (linsys_ctx->width * 2 * sizeof(uint16_t)), 16 );
 
@@ -535,7 +570,11 @@ static int handle_video_frame( linsys_opts_t *linsys_opts, uint8_t *data )
     av_free( anc_buf );
 
     if( linsys_opts->probe )
-        av_freep( &output->plane[0] );
+    {
+        raw_frame->release_data( raw_frame );
+        raw_frame->release_frame( raw_frame );
+        linsys_ctx->raw_frame = NULL;
+    }
     else
     {
         if( linsys_ctx->has_vanc )
@@ -596,6 +635,10 @@ static int handle_video_frame( linsys_opts_t *linsys_opts, uint8_t *data )
         raw_frame->pts = pts = av_rescale_q( linsys_ctx->v_counter++, linsys_ctx->v_timebase, (AVRational){1, OBE_CLOCK} );
 
         add_to_filter_queue( h, raw_frame );
+
+        /* Reset frame information */
+        linsys_ctx->raw_frame = NULL;
+        linsys_ctx->line_idx = 0;
 
         /* Send any DVB-VBI frames */
         if( linsys_ctx->non_display_parser.has_vbi_frame )
@@ -711,6 +754,9 @@ static int capture_data( linsys_opts_t *linsys_opts )
     struct pollfd pfd[2];
     linsys_ctx_t *linsys_ctx = &linsys_opts->linsys_ctx;
 
+    if( linsys_ctx->non_display_parser.has_probed )
+        return 0;
+
     pfd[0].fd = linsys_ctx->vfd;
     pfd[0].events = POLLIN | POLLPRI;
 
@@ -776,8 +822,10 @@ static int capture_data( linsys_opts_t *linsys_opts )
             return -1;
         }
 
-        if( handle_video_frame( linsys_opts, linsys_ctx->vbuffers[linsys_ctx->current_vbuffer] ) < 0 )
+        if( !linsys_ctx->frame_phase && new_frame( linsys_opts ) < 0 )
             return -1;
+
+        handle_lines( linsys_opts, linsys_ctx->vbuffers[linsys_ctx->current_vbuffer] );
 
         if( ioctl( linsys_ctx->vfd, SDIVIDEO_IOC_QBUF, linsys_ctx->current_vbuffer ) < 0 )
         {
@@ -787,6 +835,14 @@ static int capture_data( linsys_opts_t *linsys_opts )
 
         linsys_ctx->current_vbuffer++;
         linsys_ctx->current_vbuffer %= linsys_ctx->num_vbuffers;
+
+        linsys_ctx->frame_phase++;
+        linsys_ctx->frame_phase %= linsys_ctx->frame_slices;
+
+        int64_t handle_vf_time = obe_mdate();
+
+        if( !linsys_ctx->frame_phase && handle_video_frame( linsys_opts ) < 0 )
+            return -1;
     }
 
     if( pfd[1].revents & POLLIN  )
@@ -1058,7 +1114,13 @@ static int open_card( linsys_opts_t *linsys_opts )
     {
         linsys_ctx->vbuffer_size += (video_format_tab[i].total_height - video_format_tab[i].height) * linsys_ctx->stride;
         linsys_ctx->coded_height = video_format_tab[i].total_height;
+        linsys_ctx->frame_slices = 5;
     }
+    else
+        linsys_ctx->frame_slices = 2;
+
+    linsys_ctx->slice_height = linsys_ctx->coded_height / linsys_ctx->frame_slices;
+    linsys_ctx->vbuffer_size /= linsys_ctx->frame_slices;
 
     linsys_ctx->num_vbuffers = NB_VBUFFERS;
 
@@ -1241,6 +1303,10 @@ static void *open_input( void *ptr )
 
     non_display_parser = &linsys_ctx->non_display_parser;
     non_display_parser->teletext_location = device->user_opts.teletext_location;
+
+    struct sched_param param = {0};
+    param.sched_priority = 70;
+    pthread_setschedparam( pthread_self(), SCHED_FIFO, &param );
 
     /* TODO: wait for encoder */
 
